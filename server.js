@@ -1505,7 +1505,8 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
     console.log(`📊 Fetching notifications for student: ${studentId}, year: ${year || 'all'}`);
 
     // Query notifications table - using correct column names from Railway
-    let query = 'SELECT id, student_id, type, title, message, date, year, time, read FROM notifications WHERE student_id = ?';
+    // Note: 'read' is a reserved keyword in MySQL, so we need to escape it with backticks
+    let query = 'SELECT id, student_id, type, title, message, date, year, time, `read` FROM notifications WHERE student_id = ?';
     let params = [studentId];
 
     if (year) {
@@ -1558,8 +1559,9 @@ app.post('/api/notifications/:id/read', authenticateToken, async (req, res) => {
 
     // Update the read status to 1 (true) for this notification
     // Only allow updating notifications that belong to this student
+    // Note: 'read' is a reserved keyword in MySQL, so we need to escape it with backticks
     const [result] = await pool.execute(
-      'UPDATE notifications SET read = 1 WHERE id = ? AND student_id = ?',
+      'UPDATE notifications SET `read` = 1 WHERE id = ? AND student_id = ?',
       [notificationId, studentId]
     );
 
@@ -1590,7 +1592,8 @@ app.post('/api/notifications/mark-all-read', authenticateToken, async (req, res)
 
     console.log(`📝 Marking all notifications as read for student: ${studentId}, year: ${year || 'all'}`);
 
-    let query = 'UPDATE notifications SET read = 1 WHERE student_id = ? AND read = 0';
+    // Note: 'read' is a reserved keyword in MySQL, so we need to escape it with backticks
+    let query = 'UPDATE notifications SET `read` = 1 WHERE student_id = ? AND `read` = 0';
     let params = [studentId];
 
     if (year) {
@@ -1854,7 +1857,7 @@ async function checkForNewRecords() {
           const nextId = (maxIdResult[0]?.max_id || 0) + 1;
           
           await pool.execute(
-            'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, read) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [nextId, studentId, 'payment', notificationTitle, fullMessage, dateStr, year, payment.p_time || null, 0]
           );
         } catch (insertError) {
@@ -1863,7 +1866,7 @@ async function checkForNewRecords() {
             const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
             const nextId = (maxIdResult[0]?.max_id || 0) + 10; // Add buffer to avoid conflicts
             await pool.execute(
-              'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, read) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
               [nextId, studentId, 'payment', notificationTitle, fullMessage, dateStr, year, payment.p_time || null, 0]
             );
           } else {
@@ -1990,7 +1993,7 @@ async function checkForNewRecords() {
             const nextId = (maxIdResult[0]?.max_id || 0) + 1;
             
             await pool.execute(
-              'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, read) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
               [nextId, studentId, 'attendance', notificationTitle, fullMessage, dateStr, year, timeStr || null, 0]
             );
           } catch (insertError) {
@@ -1999,7 +2002,7 @@ async function checkForNewRecords() {
               const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
               const nextId = (maxIdResult[0]?.max_id || 0) + 10; // Add buffer to avoid conflicts
               await pool.execute(
-                'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, read) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 [nextId, studentId, 'attendance', notificationTitle, fullMessage, dateStr, year, timeStr || null, 0]
               );
             } else {
