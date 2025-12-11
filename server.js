@@ -94,6 +94,17 @@ const emailTransporter = nodemailer.createTransport({
   }
 });
 
+// Verify email transporter connection on startup
+emailTransporter.verify(function (error, success) {
+  if (error) {
+    console.error('❌ Email transporter verification failed:', error);
+    console.error('📧 Email service may not work properly. Please check your email credentials.');
+  } else {
+    console.log('✅ Email transporter verified successfully');
+    console.log('📧 Email service is ready to send emails');
+  }
+});
+
 // Store verification codes temporarily (in production, use Redis or database)
 const verificationCodes = new Map(); // studentId -> { code, expiresAt, email }
 
@@ -386,15 +397,33 @@ app.post('/api/auth/send-verification-code', async (req, res) => {
       `
     };
 
-    await emailTransporter.sendMail(mailOptions);
+    console.log(`📧 Attempting to send verification email to ${email} for student ${studentId}...`);
+    console.log(`📧 Email details: From: ${mailOptions.from}, To: ${mailOptions.to}, Subject: ${mailOptions.subject}`);
+    
+    const emailResult = await emailTransporter.sendMail(mailOptions);
+    
+    // Log successful email sending with details
+    console.log('✅ EMAIL SENT SUCCESSFULLY!');
+    console.log(`📧 Message ID: ${emailResult.messageId}`);
+    console.log(`📧 Response: ${emailResult.response}`);
+    console.log(`📧 Accepted recipients: ${JSON.stringify(emailResult.accepted)}`);
+    console.log(`📧 Rejected recipients: ${JSON.stringify(emailResult.rejected)}`);
     console.log(`📧 Verification code sent to ${email} for student ${studentId}`);
+    console.log(`📧 Verification code: ${verificationCode} (expires in 2 minutes)`);
 
     res.json({
       success: true,
       message: 'Verification code sent to your email'
     });
   } catch (error) {
-    console.error('Send verification code error:', error);
+    console.error('❌ EMAIL SENDING FAILED!');
+    console.error('❌ Error details:', error);
+    console.error('❌ Error message:', error.message);
+    console.error('❌ Error code:', error.code);
+    console.error('❌ Error response:', error.response);
+    console.error('❌ Error responseCode:', error.responseCode);
+    console.error('❌ Full error object:', JSON.stringify(error, null, 2));
+    console.error(`❌ Failed to send verification code to ${email} for student ${studentId}`);
     res.status(500).json({ success: false, error: 'Failed to send verification code' });
   }
 });
