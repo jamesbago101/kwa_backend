@@ -1784,6 +1784,71 @@ app.post('/api/notifications/mark-all-read', authenticateToken, async (req, res)
   }
 });
 
+// Diagnostic endpoint to check notifications table structure and data
+app.get('/api/notifications/debug', authenticateToken, async (req, res) => {
+  try {
+    const studentId = req.studentId;
+    
+    // Check if notifications table exists and get structure
+    let tableInfo = 'Table not found or error';
+    try {
+      const [columns] = await pool.execute(
+        `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT 
+         FROM INFORMATION_SCHEMA.COLUMNS 
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'notifications' 
+         ORDER BY ORDINAL_POSITION`,
+        [dbConfig.database]
+      );
+      tableInfo = columns;
+    } catch (e) {
+      tableInfo = `Error: ${e.message}`;
+    }
+    
+    // Get total notifications for this student
+    let totalNotifications = 0;
+    let unreadNotifications = 0;
+    try {
+      const [total] = await pool.execute(
+        'SELECT COUNT(*) as count FROM notifications WHERE student_id = ?',
+        [studentId]
+      );
+      totalNotifications = total[0]?.count || 0;
+      
+      const [unread] = await pool.execute(
+        'SELECT COUNT(*) as count FROM notifications WHERE student_id = ? AND `read` = 0',
+        [studentId]
+      );
+      unreadNotifications = unread[0]?.count || 0;
+    } catch (e) {
+      console.error('Error counting notifications:', e);
+    }
+    
+    // Get recent notifications
+    let recentNotifications = [];
+    try {
+      const [recent] = await pool.execute(
+        'SELECT id, student_id, type, title, message, date, year, time, `read` FROM notifications WHERE student_id = ? ORDER BY id DESC LIMIT 5',
+        [studentId]
+      );
+      recentNotifications = recent;
+    } catch (e) {
+      console.error('Error fetching recent notifications:', e);
+    }
+    
+    res.json({
+      success: true,
+      studentId,
+      tableStructure: tableInfo,
+      totalNotifications,
+      unreadNotifications,
+      recentNotifications,
+    });
+  } catch (error) {
+    console.error('❌ Debug endpoint error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Helper function to get notification title based on type
 function getNotificationTitle(type) {
   switch (type) {
@@ -2063,6 +2128,10 @@ async function checkForNewRecords() {
     const [recentPayments] = await pool.execute(
       'SELECT p_id, student_id, p_total, or_no, p_date, p_time, p_year, p_semester, p_full_name FROM payment_history WHERE p_date >= DATE_SUB(NOW(), INTERVAL 5 MINUTE) ORDER BY p_date DESC, p_time DESC'
     );
+    
+    if (recentPayments.length > 0) {
+      console.log(`🔍 Found ${recentPayments.length} recent payment(s) to check for notifications`);
+    }
 
     for (const payment of recentPayments) {
       const studentId = payment.student_id;
@@ -2123,18 +2192,28 @@ async function checkForNewRecords() {
             'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [nextId, studentId, 'payment', notificationTitle, fullMessage, dateStr, year, payment.p_time || null, 0]
           );
+          console.log(`✅ Payment notification inserted: ID=${nextId}, Student=${studentId}, Title="${notificationTitle}"`);
         } catch (insertError) {
           // If duplicate key error, try with a higher ID
           if (insertError.code === 'ER_DUP_ENTRY') {
-            const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
-            const nextId = (maxIdResult[0]?.max_id || 0) + 10; // Add buffer to avoid conflicts
-            await pool.execute(
-              'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-              [nextId, studentId, 'payment', notificationTitle, fullMessage, dateStr, year, payment.p_time || null, 0]
-            );
+            try {
+              const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
+              const nextId = (maxIdResult[0]?.max_id || 0) + 10; // Add buffer to avoid conflicts
+              await pool.execute(
+                'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [nextId, studentId, 'payment', notificationTitle, fullMessage, dateStr, year, payment.p_time || null, 0]
+              );
+              console.log(`✅ Payment notification inserted (retry): ID=${nextId}, Student=${studentId}`);
+            } catch (retryError) {
+              console.error(`❌ Error inserting payment notification (retry failed):`, retryError.message);
+              console.error('   SQL Error:', retryError.sqlMessage || retryError.message);
+            }
           } else {
-            console.error('❌ Error inserting payment notification:', insertError);
-            throw insertError;
+            console.error('❌ Error inserting payment notification:', insertError.message);
+            console.error('   SQL Error:', insertError.sqlMessage || insertError.message);
+            console.error('   SQL State:', insertError.sqlState || 'N/A');
+            console.error('   Error Code:', insertError.code || 'N/A');
+            // Don't throw - continue processing other payments
           }
         }
 
@@ -2195,7 +2274,11 @@ async function checkForNewRecords() {
 
     // Update the highest ID we've seen
     if (recentAttendance.length > 0) {
-      lastAttendanceId = Math.max(lastAttendanceId, ...recentAttendance.map(r => r.id));
+      const newMaxId = Math.max(lastAttendanceId, ...recentAttendance.map(r => r.id));
+      if (newMaxId > lastAttendanceId) {
+        console.log(`🔍 Found ${recentAttendance.length} recent attendance record(s) to check for notifications (last ID: ${lastAttendanceId} -> ${newMaxId})`);
+        lastAttendanceId = newMaxId;
+      }
     }
 
     for (const record of recentAttendance) {
@@ -2341,6 +2424,8 @@ async function checkForNewRecords() {
 
   } catch (error) {
     console.error('❌ Error checking for new records:', error);
+    console.error('   Error message:', error.message);
+    console.error('   Error stack:', error.stack);
   }
 }
 
