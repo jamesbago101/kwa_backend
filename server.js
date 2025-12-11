@@ -6,6 +6,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
+const { Expo } = require('expo-server-sdk');
 require('dotenv').config();
 
 const app = express();
@@ -123,6 +124,149 @@ emailTransporter.verify(function (error, success) {
 
 // Store verification codes temporarily (in production, use Redis or database)
 const verificationCodes = new Map(); // studentId -> { code, expiresAt, email }
+
+// Initialize Expo Push Notification client
+const expo = new Expo();
+let expoInitialized = true; // Expo SDK doesn't require initialization, just instantiation
+console.log('✅ Expo Push Notification service initialized');
+
+// Helper function to get ALL push tokens for a student_id from users_push_tokens table
+// Falls back to student_push_tokens if users_push_tokens doesn't exist
+async function getAllPushTokensForStudent(studentId) {
+  try {
+    // First try users_push_tokens table
+    let [tokenRows] = await pool.execute(
+      'SELECT push_token FROM users_push_tokens WHERE student_id = ?',
+      [studentId]
+    );
+    
+    // If no results, try student_push_tokens table (backward compatibility)
+    if (tokenRows.length === 0) {
+      try {
+        [tokenRows] = await pool.execute(
+          'SELECT push_token FROM student_push_tokens WHERE student_id = ?',
+          [studentId]
+        );
+      } catch (err) {
+        // Table doesn't exist, return empty array
+        return [];
+      }
+    }
+    
+    // Extract all push tokens
+    return tokenRows.map(row => row.push_token).filter(token => token && token.trim() !== '');
+  } catch (error) {
+    console.error(`❌ Error getting push tokens for student ${studentId}:`, error.message);
+    return [];
+  }
+}
+
+// Helper function to send push notification via Expo
+async function sendPushNotification(pushTokens, title, message, data = {}) {
+  if (!pushTokens || pushTokens.length === 0) {
+    return { success: false, reason: 'No push tokens provided' };
+  }
+
+  if (!expoInitialized) {
+    return { success: false, reason: 'Expo not initialized', tokens: pushTokens };
+  }
+
+  try {
+    // Filter out invalid Expo push tokens
+    const validTokens = pushTokens.filter(token => Expo.isExpoPushToken(token));
+    
+    if (validTokens.length === 0) {
+      console.log('⚠️  No valid Expo push tokens found');
+      return { success: false, reason: 'No valid Expo push tokens' };
+    }
+
+    // Create messages for each token
+    const messages = validTokens.map(token => ({
+      to: token,
+      sound: 'default',
+      title: title,
+      body: message,
+      data: {
+        ...data,
+        title: title,
+        message: message,
+      },
+      priority: 'high',
+      channelId: 'default',
+    }));
+
+    // Send notifications in chunks (Expo allows up to 100 at a time)
+    const chunks = expo.chunkPushNotifications(messages);
+    const tickets = [];
+    
+    for (const chunk of chunks) {
+      try {
+        const ticketChunk = await expo.sendPushNotificationsAsync(chunk);
+        tickets.push(...ticketChunk);
+      } catch (error) {
+        console.error('❌ Error sending push notification chunk:', error);
+      }
+    }
+
+    // Check ticket responses for errors
+    let successCount = 0;
+    let failureCount = 0;
+    const invalidTokens = [];
+
+    for (let i = 0; i < tickets.length; i++) {
+      const ticket = tickets[i];
+      const token = validTokens[i];
+
+      if (ticket.status === 'ok') {
+        successCount++;
+        // Check if we need to handle receipt (for production, you'd want to check receipts later)
+      } else if (ticket.status === 'error') {
+        failureCount++;
+        console.error(`❌ Error sending to token ${token}:`, ticket.message);
+        
+        // Check if token is invalid and should be removed
+        if (ticket.details && ticket.details.error === 'DeviceNotRegistered') {
+          invalidTokens.push(token);
+        }
+      }
+    }
+
+    // Remove invalid tokens from database
+    if (invalidTokens.length > 0) {
+      for (const invalidToken of invalidTokens) {
+        try {
+          // Try users_push_tokens first
+          await pool.execute(
+            'DELETE FROM users_push_tokens WHERE push_token = ?',
+            [invalidToken]
+          );
+        } catch (err) {
+          // Try student_push_tokens as fallback
+          try {
+            await pool.execute(
+              'DELETE FROM student_push_tokens WHERE push_token = ?',
+              [invalidToken]
+            );
+          } catch (err2) {
+            // Ignore if table doesn't exist
+          }
+        }
+      }
+      console.log(`🗑️  Removed ${invalidTokens.length} invalid push token(s) from database`);
+    }
+
+    console.log(`✅ Expo push notification sent: ${successCount} successful, ${failureCount} failed`);
+    
+    return {
+      success: successCount > 0,
+      successCount: successCount,
+      failureCount: failureCount,
+    };
+  } catch (error) {
+    console.error('❌ Error sending Expo push notification:', error);
+    return { success: false, error: error.message };
+  }
+}
 
 // Helper function to execute queries
 const query = async (sql, params = []) => {
@@ -1427,7 +1571,7 @@ app.get('/api/years', authenticateToken, async (req, res) => {
 });
 
 // Register push token endpoint
-// Push tokens are stored in a separate table: student_push_tokens
+// Push tokens are stored in users_push_tokens table (with fallback to student_push_tokens)
 // Table structure: id, student_id, push_token, device_info, created_at, updated_at
 app.post('/api/push-token', authenticateToken, async (req, res) => {
   try {
@@ -1438,57 +1582,81 @@ app.post('/api/push-token', authenticateToken, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Push token is required' });
     }
 
-    // Check if student_push_tokens table exists, if not create it
+    // Determine which table to use - prefer users_push_tokens, fallback to student_push_tokens
+    let tableName = 'users_push_tokens';
     try {
-      await pool.execute(`
-        CREATE TABLE IF NOT EXISTS student_push_tokens (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          student_id VARCHAR(50) NOT NULL,
-          push_token TEXT NOT NULL,
-          device_info VARCHAR(255),
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-          UNIQUE KEY unique_student_token (student_id, push_token(255)),
-          INDEX idx_student_id (student_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-      `);
-    } catch (tableError) {
-      console.log('📋 student_push_tokens table check:', tableError.message);
+      // Check if users_push_tokens table exists
+      await pool.execute('SELECT 1 FROM users_push_tokens LIMIT 1');
+    } catch (tableCheckError) {
+      // Table doesn't exist, use student_push_tokens
+      tableName = 'student_push_tokens';
+      
+      // Try to create users_push_tokens table first (preferred table)
+      try {
+        await pool.execute(`
+          CREATE TABLE IF NOT EXISTS users_push_tokens (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            student_id VARCHAR(50) NOT NULL,
+            push_token TEXT NOT NULL,
+            device_info VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY unique_student_token (student_id, push_token(255)),
+            INDEX idx_student_id (student_id)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        `);
+        tableName = 'users_push_tokens';
+        console.log('✅ Created users_push_tokens table');
+      } catch (createError) {
+        // If creation fails, try to create/use student_push_tokens (backward compatibility)
+        try {
+          await pool.execute(`
+            CREATE TABLE IF NOT EXISTS student_push_tokens (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              student_id VARCHAR(50) NOT NULL,
+              push_token TEXT NOT NULL,
+              device_info VARCHAR(255),
+              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              UNIQUE KEY unique_student_token (student_id, push_token(255)),
+              INDEX idx_student_id (student_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+          `);
+          console.log('✅ Created/using student_push_tokens table (fallback)');
+        } catch (studentTableError) {
+          console.log('⚠️  Could not create push token table:', studentTableError.message);
+        }
+      }
     }
 
-    // Update or insert push token in student_push_tokens table
-    // Use INSERT ... ON DUPLICATE KEY UPDATE or REPLACE
+    // Update or insert push token (allow multiple tokens per student for multiple devices)
     try {
       await pool.execute(
-        'INSERT INTO student_push_tokens (student_id, push_token, device_info, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW()) ON DUPLICATE KEY UPDATE push_token = ?, device_info = ?, updated_at = NOW()',
-        [studentId, pushToken, deviceInfo || null, pushToken, deviceInfo || null]
+        `INSERT INTO ${tableName} (student_id, push_token, device_info, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW()) ON DUPLICATE KEY UPDATE device_info = ?, updated_at = NOW()`,
+        [studentId, pushToken, deviceInfo || null, deviceInfo || null]
       );
     } catch (insertError) {
       // If ON DUPLICATE KEY doesn't work, try UPDATE first then INSERT
       const [existing] = await pool.execute(
-        'SELECT id FROM student_push_tokens WHERE student_id = ? AND push_token = ?',
+        `SELECT id FROM ${tableName} WHERE student_id = ? AND push_token = ?`,
         [studentId, pushToken]
       );
 
       if (existing.length > 0) {
         await pool.execute(
-          'UPDATE student_push_tokens SET device_info = ?, updated_at = NOW() WHERE student_id = ? AND push_token = ?',
+          `UPDATE ${tableName} SET device_info = ?, updated_at = NOW() WHERE student_id = ? AND push_token = ?`,
           [deviceInfo || null, studentId, pushToken]
         );
       } else {
-        // Remove old token for this student and insert new one (one token per student)
+        // Insert new token (allows multiple tokens per student for multiple devices)
         await pool.execute(
-          'DELETE FROM student_push_tokens WHERE student_id = ?',
-          [studentId]
-        );
-        await pool.execute(
-          'INSERT INTO student_push_tokens (student_id, push_token, device_info, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW())',
+          `INSERT INTO ${tableName} (student_id, push_token, device_info, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW())`,
           [studentId, pushToken, deviceInfo || null]
         );
       }
     }
 
-    console.log(`✅ Push token registered for student: ${studentId}`);
+    console.log(`✅ Push token registered for student: ${studentId} in ${tableName}`);
     res.json({ success: true, message: 'Push token registered successfully' });
   } catch (error) {
     console.error('❌ Error registering push token:', error);
@@ -1793,6 +1961,101 @@ io.on('connection', (socket) => {
 let lastPaymentCheck = {};
 let lastAttendanceCheck = {};
 let lastAttendanceId = 0; // Track the highest attendance ID we've seen
+let lastNotificationCheck = {}; // Track notifications we've already sent push for
+
+// Function to check notifications table for unread notifications and send push notifications
+async function checkForUnreadNotifications() {
+  try {
+    // Get all unread notifications from the notifications table
+    const [unreadNotifications] = await pool.execute(
+      'SELECT id, student_id, type, title, message, date, year, time, `read` FROM notifications WHERE `read` = 0 ORDER BY id DESC LIMIT 100'
+    );
+
+    for (const notification of unreadNotifications) {
+      const notificationKey = `notif_${notification.id}`;
+      
+      // Skip if we've already processed this notification
+      if (lastNotificationCheck[notificationKey]) {
+        continue;
+      }
+
+      const studentId = notification.student_id;
+      
+      // Mark as processed (but don't send push if notification is too old - more than 1 hour)
+      const notificationDate = notification.date instanceof Date 
+        ? notification.date 
+        : new Date(notification.date);
+      const now = new Date();
+      const hoursSinceCreated = (now - notificationDate) / (1000 * 60 * 60);
+      
+      // Only send push for notifications created within the last hour
+      if (hoursSinceCreated > 1) {
+        lastNotificationCheck[notificationKey] = true;
+        continue;
+      }
+
+      lastNotificationCheck[notificationKey] = true;
+
+      // Get ALL push tokens for this student
+      const pushTokens = await getAllPushTokensForStudent(studentId);
+
+      if (pushTokens.length > 0) {
+        // Send push notification via FCM
+        const pushResult = await sendPushNotification(
+          pushTokens,
+          notification.title || 'Notification',
+          notification.message || '',
+          {
+            notificationId: String(notification.id),
+            type: notification.type || 'announcement',
+            date: notification.date instanceof Date 
+              ? notification.date.toISOString().split('T')[0]
+              : notification.date || new Date().toISOString().split('T')[0],
+          }
+        );
+
+        // Also send via Socket.IO (if client is connected)
+        io.to(`student_${studentId}`).emit('notification', {
+          id: notification.id,
+          type: notification.type || 'announcement',
+          title: notification.title || 'Notification',
+          message: notification.message || '',
+          date: notification.date instanceof Date 
+            ? notification.date.toISOString().split('T')[0]
+            : notification.date || new Date().toISOString().split('T')[0],
+          read: false,
+        });
+
+        if (pushResult.success) {
+          console.log(`📤 Push notification sent to student ${studentId}: ${pushResult.successCount} device(s) - "${notification.title}"`);
+        } else {
+          console.log(`⚠️  Push notification failed for student ${studentId}: ${pushResult.reason || pushResult.error}`);
+        }
+      } else {
+        // Still send via Socket.IO even if no push tokens
+        io.to(`student_${studentId}`).emit('notification', {
+          id: notification.id,
+          type: notification.type || 'announcement',
+          title: notification.title || 'Notification',
+          message: notification.message || '',
+          date: notification.date instanceof Date 
+            ? notification.date.toISOString().split('T')[0]
+            : notification.date || new Date().toISOString().split('T')[0],
+          read: false,
+        });
+        console.log(`⚠️  No push tokens found for student ${studentId}, sent via Socket.IO only`);
+      }
+    }
+
+    // Clean up old check records (keep last 1000 entries)
+    if (Object.keys(lastNotificationCheck).length > 1000) {
+      const keys = Object.keys(lastNotificationCheck);
+      keys.slice(0, keys.length - 1000).forEach(key => delete lastNotificationCheck[key]);
+    }
+  } catch (error) {
+    console.error('❌ Error checking for unread notifications:', error);
+  }
+}
 
 async function checkForNewRecords() {
   try {
@@ -1875,26 +2138,41 @@ async function checkForNewRecords() {
           }
         }
 
-        // Get push token from student_push_tokens table
-        const [tokenRows] = await pool.execute(
-          'SELECT push_token FROM student_push_tokens WHERE student_id = ? LIMIT 1',
-          [studentId]
-        );
+        // Get ALL push tokens for this student
+        const pushTokens = await getAllPushTokensForStudent(studentId);
+
+        // Send push notification via FCM (if tokens available)
+        if (pushTokens.length > 0) {
+          const pushResult = await sendPushNotification(
+            pushTokens,
+            notificationTitle,
+            message,
+            {
+              notificationId: String(nextId),
+              type: 'payment',
+              date: dateStr,
+            }
+          );
+
+          if (pushResult.success) {
+            console.log(`📤 Push notification sent to student ${studentId}: ${pushResult.successCount} device(s) - Payment received`);
+          } else {
+            console.log(`⚠️  Push notification failed for student ${studentId}: ${pushResult.reason || pushResult.error}`);
+          }
+        }
 
         // Send push notification via Socket.IO (if client is connected)
         io.to(`student_${studentId}`).emit('notification', {
+          id: nextId,
           type: 'payment',
           title: notificationTitle,
           message: message,
           date: dateStr,
+          read: false,
         });
 
-        if (tokenRows.length > 0) {
-          console.log(`📤 Push notification sent to student ${studentId}: Payment received (via Socket.IO)`);
-          // Here you could also send to external push notification service (FCM, etc.)
-          // using tokenRows[0].push_token
-        } else {
-          console.log(`⚠️  No push token found for student ${studentId}, notification saved but not pushed`);
+        if (pushTokens.length === 0) {
+          console.log(`⚠️  No push tokens found for student ${studentId}, notification saved but not pushed`);
         }
       }
     }
@@ -2011,26 +2289,41 @@ async function checkForNewRecords() {
             }
           }
 
-          // Get push token from student_push_tokens table
-          const [tokenRows] = await pool.execute(
-            'SELECT push_token FROM student_push_tokens WHERE student_id = ? LIMIT 1',
-            [studentId]
-          );
+          // Get ALL push tokens for this student
+          const pushTokens = await getAllPushTokensForStudent(studentId);
+
+          // Send push notification via FCM (if tokens available)
+          if (pushTokens.length > 0) {
+            const pushResult = await sendPushNotification(
+              pushTokens,
+              notificationTitle,
+              message,
+              {
+                notificationId: String(nextId),
+                type: 'attendance',
+                date: dateStr,
+              }
+            );
+
+            if (pushResult.success) {
+              console.log(`📤 Push notification sent to student ${studentId}: ${pushResult.successCount} device(s) - ${studentName} - ${status}`);
+            } else {
+              console.log(`⚠️  Push notification failed for student ${studentId}: ${pushResult.reason || pushResult.error}`);
+            }
+          }
 
           // Send push notification via Socket.IO (if client is connected)
           io.to(`student_${studentId}`).emit('notification', {
+            id: nextId,
             type: 'attendance',
             title: notificationTitle,
             message: message,
             date: dateStr,
+            read: false,
           });
 
-          if (tokenRows.length > 0) {
-            console.log(`📤 Push notification sent to student ${studentId}: ${studentName} - ${status} (via Socket.IO)`);
-            // Here you could also send to external push notification service (FCM, etc.)
-            // using tokenRows[0].push_token
-          } else {
-            console.log(`⚠️  No push token found for student ${studentId}, notification saved but not pushed`);
+          if (pushTokens.length === 0) {
+            console.log(`⚠️  No push tokens found for student ${studentId}, notification saved but not pushed`);
           }
         }
       }
@@ -2054,6 +2347,10 @@ async function checkForNewRecords() {
 // Run database monitoring every 30 seconds
 setInterval(checkForNewRecords, 30000);
 console.log('🔍 Database monitoring started (checking every 30 seconds)');
+
+// Also check for unread notifications every 30 seconds (with a slight delay to avoid conflicts)
+setInterval(checkForUnreadNotifications, 30000);
+console.log('🔍 Notification push monitoring started (checking every 30 seconds)');
 
 // Start server after a brief delay to allow connection test to complete
 setTimeout(() => {
