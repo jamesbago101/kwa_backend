@@ -85,20 +85,35 @@ pool.on('error', (err) => {
 // JWT Secret (in production, use environment variable)
 const JWT_SECRET = process.env.JWT_SECRET || 'kwai_portal_secret_key_2024';
 
-// Email configuration
+// Email configuration with timeout and connection settings
 const emailTransporter = nodemailer.createTransport({
   service: 'gmail',
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false, // true for 465, false for other ports
   auth: {
-    user: 'knewcodesolutions@gmail.com',
-    pass: 'afeyyqhuewufgidr'
-  }
+    user: process.env.EMAIL_USER || 'knewcodesolutions@gmail.com',
+    pass: process.env.EMAIL_PASS || 'afeyyqhuewufgidr'
+  },
+  connectionTimeout: 10000, // 10 seconds
+  greetingTimeout: 10000, // 10 seconds
+  socketTimeout: 10000, // 10 seconds
+  debug: true, // Enable debug output
+  logger: true // Log to console
 });
 
-// Verify email transporter connection on startup
+// Verify email transporter connection on startup (non-blocking)
 emailTransporter.verify(function (error, success) {
   if (error) {
-    console.error('❌ Email transporter verification failed:', error);
-    console.error('📧 Email service may not work properly. Please check your email credentials.');
+    console.error('❌ Email transporter verification failed:', error.message);
+    console.error('❌ Error code:', error.code);
+    console.error('❌ Error command:', error.command);
+    console.error('📧 Email service may not work properly. Please check:');
+    console.error('   1. Email credentials are correct');
+    console.error('   2. Gmail app password is valid');
+    console.error('   3. Server can reach smtp.gmail.com (port 587)');
+    console.error('   4. Firewall allows outbound SMTP connections');
+    console.error('   5. Gmail allows "Less secure app access" or app password is used');
   } else {
     console.log('✅ Email transporter verified successfully');
     console.log('📧 Email service is ready to send emails');
@@ -400,31 +415,77 @@ app.post('/api/auth/send-verification-code', async (req, res) => {
     console.log(`📧 Attempting to send verification email to ${email} for student ${studentId}...`);
     console.log(`📧 Email details: From: ${mailOptions.from}, To: ${mailOptions.to}, Subject: ${mailOptions.subject}`);
     
-    const emailResult = await emailTransporter.sendMail(mailOptions);
+    // Retry logic for email sending (3 attempts with exponential backoff)
+    let emailResult;
+    let lastError;
+    const maxRetries = 3;
     
-    // Log successful email sending with details
-    console.log('✅ EMAIL SENT SUCCESSFULLY!');
-    console.log(`📧 Message ID: ${emailResult.messageId}`);
-    console.log(`📧 Response: ${emailResult.response}`);
-    console.log(`📧 Accepted recipients: ${JSON.stringify(emailResult.accepted)}`);
-    console.log(`📧 Rejected recipients: ${JSON.stringify(emailResult.rejected)}`);
-    console.log(`📧 Verification code sent to ${email} for student ${studentId}`);
-    console.log(`📧 Verification code: ${verificationCode} (expires in 2 minutes)`);
-
-    res.json({
-      success: true,
-      message: 'Verification code sent to your email'
-    });
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`📧 Email send attempt ${attempt}/${maxRetries}...`);
+        emailResult = await emailTransporter.sendMail(mailOptions);
+        
+        // Log successful email sending with details
+        console.log('✅ EMAIL SENT SUCCESSFULLY!');
+        console.log(`📧 Message ID: ${emailResult.messageId}`);
+        console.log(`📧 Response: ${emailResult.response}`);
+        console.log(`📧 Accepted recipients: ${JSON.stringify(emailResult.accepted)}`);
+        console.log(`📧 Rejected recipients: ${JSON.stringify(emailResult.rejected)}`);
+        console.log(`📧 Verification code sent to ${email} for student ${studentId}`);
+        console.log(`📧 Verification code: ${verificationCode} (expires in 2 minutes)`);
+        
+        res.json({
+          success: true,
+          message: 'Verification code sent to your email'
+        });
+        return; // Success, exit the function
+      } catch (error) {
+        lastError = error;
+        console.error(`❌ Email send attempt ${attempt}/${maxRetries} failed`);
+        console.error(`❌ Error: ${error.message}`);
+        console.error(`❌ Error code: ${error.code}`);
+        
+        // If not the last attempt, wait before retrying
+        if (attempt < maxRetries) {
+          const waitTime = Math.pow(2, attempt) * 1000; // Exponential backoff: 2s, 4s, 8s
+          console.log(`⏳ Retrying in ${waitTime/1000} seconds...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+      }
+    }
+    
+    // If we get here, all retries failed
+    throw lastError;
+    
   } catch (error) {
-    console.error('❌ EMAIL SENDING FAILED!');
+    console.error('❌ EMAIL SENDING FAILED AFTER ALL RETRIES!');
     console.error('❌ Error details:', error);
     console.error('❌ Error message:', error.message);
     console.error('❌ Error code:', error.code);
+    console.error('❌ Error command:', error.command);
     console.error('❌ Error response:', error.response);
     console.error('❌ Error responseCode:', error.responseCode);
-    console.error('❌ Full error object:', JSON.stringify(error, null, 2));
+    
+    // Provide helpful error messages based on error type
+    let errorMessage = 'Failed to send verification code';
+    if (error.code === 'ETIMEDOUT' || error.code === 'ECONNREFUSED') {
+      errorMessage = 'Email service is currently unavailable. Please try again later or contact support.';
+      console.error('❌ Network/Connection issue detected');
+    } else if (error.code === 'EAUTH') {
+      errorMessage = 'Email authentication failed. Please contact support.';
+      console.error('❌ Authentication issue - check email credentials');
+    } else if (error.responseCode === 535) {
+      errorMessage = 'Email authentication failed. Invalid credentials.';
+      console.error('❌ Invalid email credentials');
+    }
+    
     console.error(`❌ Failed to send verification code to ${email} for student ${studentId}`);
-    res.status(500).json({ success: false, error: 'Failed to send verification code' });
+    console.error('❌ Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
+    
+    res.status(500).json({ 
+      success: false, 
+      error: errorMessage 
+    });
   }
 });
 
