@@ -86,20 +86,21 @@ pool.on('error', (err) => {
 const JWT_SECRET = process.env.JWT_SECRET || 'kwai_portal_secret_key_2024';
 
 // Email configuration with timeout and connection settings
+// Using port 465 with SSL (more reliable than 587 with STARTTLS)
 const emailTransporter = nodemailer.createTransport({
   service: 'gmail',
   host: 'smtp.gmail.com',
-  port: 587,
-  secure: false, // true for 465, false for other ports
+  port: 465,
+  secure: true, // true for 465 (SSL), false for 587 (STARTTLS)
   auth: {
     user: process.env.EMAIL_USER || 'knewcodesolutions@gmail.com',
     pass: process.env.EMAIL_PASS || 'afeyyqhuewufgidr'
   },
-  connectionTimeout: 10000, // 10 seconds
-  greetingTimeout: 10000, // 10 seconds
-  socketTimeout: 10000, // 10 seconds
-  debug: true, // Enable debug output
-  logger: true // Log to console
+  connectionTimeout: 30000, // 30 seconds (increased for production)
+  greetingTimeout: 30000, // 30 seconds
+  socketTimeout: 30000, // 30 seconds
+  debug: process.env.NODE_ENV !== 'production', // Only debug in development
+  logger: process.env.NODE_ENV !== 'production' // Only log in development
 });
 
 // Verify email transporter connection on startup (non-blocking)
