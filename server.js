@@ -1504,16 +1504,14 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
 
     console.log(`📊 Fetching notifications for student: ${studentId}, year: ${year || 'all'}`);
 
-    // Query notifications table (not payment_history)
-    let query = 'SELECT id, student_id, type, message, date, time, status, created_at FROM notifications WHERE student_id = ?';
+    // Query notifications table - using correct column names from Railway
+    let query = 'SELECT id, student_id, type, title, message, date, year, time, read FROM notifications WHERE student_id = ?';
     let params = [studentId];
 
     if (year) {
-      // Filter by date range matching the year
-      const yearStart = `${year.split('-')[0]}-01-01`;
-      const yearEnd = `${year.split('-')[1] || year.split('-')[0]}-12-31`;
-      query += ' AND date >= ? AND date <= ?';
-      params.push(yearStart, yearEnd);
+      // Filter by year column if provided
+      query += ' AND year = ?';
+      params.push(year);
     }
 
     query += ' ORDER BY date DESC, time DESC LIMIT 50';
@@ -1524,12 +1522,12 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
     const formattedNotifications = notifications.map((notif) => ({
       id: notif.id,
       type: notif.type || 'announcement',
-      title: getNotificationTitle(notif.type),
+      title: notif.title || getNotificationTitle(notif.type),
       message: notif.message || '',
       date: notif.date instanceof Date 
         ? notif.date.toISOString().split('T')[0]
         : (notif.date || new Date().toISOString().split('T')[0]),
-      read: notif.status === 'read' || notif.status === 1,
+      read: notif.read === 1 || notif.read === true || notif.read === '1',
     }));
 
     const unreadCount = formattedNotifications.filter(n => !n.read).length;
@@ -1542,6 +1540,75 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('❌ Notifications error:', error);
     console.error('Error stack:', error.stack);
+    res.status(500).json({ success: false, error: 'Internal server error: ' + error.message });
+  }
+});
+
+// Mark a single notification as read
+app.post('/api/notifications/:id/read', authenticateToken, async (req, res) => {
+  try {
+    const studentId = req.studentId;
+    const notificationId = parseInt(req.params.id);
+
+    if (isNaN(notificationId)) {
+      return res.status(400).json({ success: false, error: 'Invalid notification ID' });
+    }
+
+    console.log(`📝 Marking notification ${notificationId} as read for student: ${studentId}`);
+
+    // Update the read status to 1 (true) for this notification
+    // Only allow updating notifications that belong to this student
+    const [result] = await pool.execute(
+      'UPDATE notifications SET read = 1 WHERE id = ? AND student_id = ?',
+      [notificationId, studentId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Notification not found or does not belong to this student' 
+      });
+    }
+
+    console.log(`✅ Notification ${notificationId} marked as read`);
+
+    res.json({
+      success: true,
+      message: 'Notification marked as read',
+    });
+  } catch (error) {
+    console.error('❌ Error marking notification as read:', error);
+    res.status(500).json({ success: false, error: 'Internal server error: ' + error.message });
+  }
+});
+
+// Mark all notifications as read for a student
+app.post('/api/notifications/mark-all-read', authenticateToken, async (req, res) => {
+  try {
+    const studentId = req.studentId;
+    const year = req.query.year; // Optional year filter
+
+    console.log(`📝 Marking all notifications as read for student: ${studentId}, year: ${year || 'all'}`);
+
+    let query = 'UPDATE notifications SET read = 1 WHERE student_id = ? AND read = 0';
+    let params = [studentId];
+
+    if (year) {
+      query += ' AND year = ?';
+      params.push(year);
+    }
+
+    const [result] = await pool.execute(query, params);
+
+    console.log(`✅ ${result.affectedRows} notification(s) marked as read`);
+
+    res.json({
+      success: true,
+      message: `${result.affectedRows} notification(s) marked as read`,
+      affectedRows: result.affectedRows,
+    });
+  } catch (error) {
+    console.error('❌ Error marking all notifications as read:', error);
     res.status(500).json({ success: false, error: 'Internal server error: ' + error.message });
   }
 });
@@ -1776,7 +1843,8 @@ async function checkForNewRecords() {
         message += '. Thank you for settling your school fees.';
 
         const notificationTitle = 'Payment Posted';
-        const fullMessage = `${notificationTitle} - ${message}`;
+        const fullMessage = message; // Store just the message, title is separate
+        const year = payment.p_year || null; // Get year from payment record
 
         // Insert notification into notifications table
         // The table's id column doesn't have AUTO_INCREMENT, so we need to provide it manually
@@ -1786,8 +1854,8 @@ async function checkForNewRecords() {
           const nextId = (maxIdResult[0]?.max_id || 0) + 1;
           
           await pool.execute(
-            'INSERT INTO notifications (id, student_id, type, message, date, time, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())',
-            [nextId, studentId, 'payment', fullMessage, dateStr, payment.p_time || null, 'unread']
+            'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, read) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [nextId, studentId, 'payment', notificationTitle, fullMessage, dateStr, year, payment.p_time || null, 0]
           );
         } catch (insertError) {
           // If duplicate key error, try with a higher ID
@@ -1795,8 +1863,8 @@ async function checkForNewRecords() {
             const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
             const nextId = (maxIdResult[0]?.max_id || 0) + 10; // Add buffer to avoid conflicts
             await pool.execute(
-              'INSERT INTO notifications (id, student_id, type, message, date, time, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())',
-              [nextId, studentId, 'payment', fullMessage, dateStr, payment.p_time || null, 'unread']
+              'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, read) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              [nextId, studentId, 'payment', notificationTitle, fullMessage, dateStr, year, payment.p_time || null, 0]
             );
           } else {
             console.error('❌ Error inserting payment notification:', insertError);
@@ -1829,11 +1897,11 @@ async function checkForNewRecords() {
     }
 
     // Check attendance for new records
-    // Note: attendance table columns: id, student_id, date, time, status
+    // Note: attendance table columns: id, student_id, date, time, status, year
     // status is always either 'TIME-IN' or 'TIME-OUT'
     // Since there's no created_at column, we track by ID to detect new records
     const [recentAttendance] = await pool.execute(
-      `SELECT a.id, a.student_id, a.date, a.time, a.status, 
+      `SELECT a.id, a.student_id, a.date, a.time, a.status, a.year,
               s.first_name, s.last_name
        FROM attendance a
        INNER JOIN students s ON a.student_id = s.student_id
@@ -1911,7 +1979,8 @@ async function checkForNewRecords() {
         // Only create notification if we have a valid status
         if (message && (status === 'TIME-IN' || status === 'TIME-OUT')) {
           const notificationTitle = 'Attendance Update';
-          const fullMessage = `${notificationTitle} - ${message}.`;
+          const fullMessage = message; // Store just the message, title is separate
+          const year = record.year || null; // Get year from attendance record
 
           // Insert notification into notifications table
           // The table's id column doesn't have AUTO_INCREMENT, so we need to provide it manually
@@ -1921,8 +1990,8 @@ async function checkForNewRecords() {
             const nextId = (maxIdResult[0]?.max_id || 0) + 1;
             
             await pool.execute(
-              'INSERT INTO notifications (id, student_id, type, message, date, time, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())',
-              [nextId, studentId, 'attendance', fullMessage, dateStr, timeStr || null, 'unread']
+              'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, read) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              [nextId, studentId, 'attendance', notificationTitle, fullMessage, dateStr, year, timeStr || null, 0]
             );
           } catch (insertError) {
             // If duplicate key error, try with a higher ID
@@ -1930,8 +1999,8 @@ async function checkForNewRecords() {
               const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
               const nextId = (maxIdResult[0]?.max_id || 0) + 10; // Add buffer to avoid conflicts
               await pool.execute(
-                'INSERT INTO notifications (id, student_id, type, message, date, time, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())',
-                [nextId, studentId, 'attendance', fullMessage, dateStr, timeStr || null, 'unread']
+                'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, read) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [nextId, studentId, 'attendance', notificationTitle, fullMessage, dateStr, year, timeStr || null, 0]
               );
             } else {
               console.error('❌ Error inserting attendance notification:', insertError);
