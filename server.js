@@ -2124,13 +2124,15 @@ async function checkForUnreadNotifications() {
 
 async function checkForNewRecords() {
   try {
-    // Check payment_history for new records (using p_date and p_time)
+    // Check payment_history for new records
+    // Changed from 5 minutes to 24 hours to catch payments that might be older when server restarts
+    // But also check if notification already exists to avoid duplicates
     const [recentPayments] = await pool.execute(
-      'SELECT p_id, student_id, p_total, or_no, p_date, p_time, p_year, p_semester, p_full_name FROM payment_history WHERE p_date >= DATE_SUB(NOW(), INTERVAL 5 MINUTE) ORDER BY p_date DESC, p_time DESC'
+      'SELECT p_id, student_id, p_total, or_no, p_date, p_time, p_year, p_semester, p_full_name FROM payment_history WHERE p_date >= DATE_SUB(NOW(), INTERVAL 24 HOUR) ORDER BY p_date DESC, p_time DESC LIMIT 100'
     );
     
     if (recentPayments.length > 0) {
-      console.log(`🔍 Found ${recentPayments.length} recent payment(s) to check for notifications`);
+      console.log(`🔍 Found ${recentPayments.length} recent payment(s) to check for notifications (last 24 hours)`);
     }
 
     for (const payment of recentPayments) {
@@ -2181,77 +2183,96 @@ async function checkForNewRecords() {
         const fullMessage = message; // Store just the message, title is separate
         const year = payment.p_year || null; // Get year from payment record
 
-        // Insert notification into notifications table
-        // The table's id column doesn't have AUTO_INCREMENT, so we need to provide it manually
-        try {
-          // Get the maximum ID and increment it
-          const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
-          const nextId = (maxIdResult[0]?.max_id || 0) + 1;
-          
-          await pool.execute(
-            'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [nextId, studentId, 'payment', notificationTitle, fullMessage, dateStr, year, payment.p_time || null, 0]
-          );
-          console.log(`✅ Payment notification inserted: ID=${nextId}, Student=${studentId}, Title="${notificationTitle}"`);
-        } catch (insertError) {
-          // If duplicate key error, try with a higher ID
-          if (insertError.code === 'ER_DUP_ENTRY') {
-            try {
-              const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
-              const nextId = (maxIdResult[0]?.max_id || 0) + 10; // Add buffer to avoid conflicts
-              await pool.execute(
-                'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [nextId, studentId, 'payment', notificationTitle, fullMessage, dateStr, year, payment.p_time || null, 0]
-              );
-              console.log(`✅ Payment notification inserted (retry): ID=${nextId}, Student=${studentId}`);
-            } catch (retryError) {
-              console.error(`❌ Error inserting payment notification (retry failed):`, retryError.message);
-              console.error('   SQL Error:', retryError.sqlMessage || retryError.message);
+        // Check if notification already exists for this payment to avoid duplicates
+        const [existingNotif] = await pool.execute(
+          'SELECT id FROM notifications WHERE student_id = ? AND type = ? AND title = ? AND message = ? AND date = ? LIMIT 1',
+          [studentId, 'payment', notificationTitle, fullMessage, dateStr]
+        );
+
+        let nextId = null;
+        
+        // Only insert if notification doesn't already exist
+        if (existingNotif.length === 0) {
+          // Insert notification into notifications table
+          // The table's id column doesn't have AUTO_INCREMENT, so we need to provide it manually
+          try {
+            // Get the maximum ID and increment it
+            const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
+            nextId = (maxIdResult[0]?.max_id || 0) + 1;
+            
+            await pool.execute(
+              'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              [nextId, studentId, 'payment', notificationTitle, fullMessage, dateStr, year, payment.p_time || null, 0]
+            );
+            console.log(`✅ Payment notification inserted: ID=${nextId}, Student=${studentId}, Title="${notificationTitle}", Payment ID=${payment.p_id}`);
+          } catch (insertError) {
+            // If duplicate key error, try with a higher ID
+            if (insertError.code === 'ER_DUP_ENTRY') {
+              try {
+                const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
+                nextId = (maxIdResult[0]?.max_id || 0) + 10; // Add buffer to avoid conflicts
+                await pool.execute(
+                  'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                  [nextId, studentId, 'payment', notificationTitle, fullMessage, dateStr, year, payment.p_time || null, 0]
+                );
+                console.log(`✅ Payment notification inserted (retry): ID=${nextId}, Student=${studentId}, Payment ID=${payment.p_id}`);
+              } catch (retryError) {
+                console.error(`❌ Error inserting payment notification (retry failed):`, retryError.message);
+                console.error('   SQL Error:', retryError.sqlMessage || retryError.message);
+                console.error('   Payment ID:', payment.p_id);
+                continue; // Skip to next payment if insertion fails
+              }
+            } else {
+              console.error('❌ Error inserting payment notification:', insertError.message);
+              console.error('   SQL Error:', insertError.sqlMessage || insertError.message);
+              console.error('   SQL State:', insertError.sqlState || 'N/A');
+              console.error('   Error Code:', insertError.code || 'N/A');
+              console.error('   Payment ID:', payment.p_id);
+              continue; // Skip to next payment if insertion fails
             }
-          } else {
-            console.error('❌ Error inserting payment notification:', insertError.message);
-            console.error('   SQL Error:', insertError.sqlMessage || insertError.message);
-            console.error('   SQL State:', insertError.sqlState || 'N/A');
-            console.error('   Error Code:', insertError.code || 'N/A');
-            // Don't throw - continue processing other payments
           }
+        } else {
+          // Notification already exists, use existing ID
+          nextId = existingNotif[0].id;
+          console.log(`ℹ️  Payment notification already exists: ID=${nextId}, Student=${studentId}, Payment ID=${payment.p_id}`);
         }
 
-        // Get ALL push tokens for this student
-        const pushTokens = await getAllPushTokensForStudent(studentId);
+        // Only send push notifications if we successfully created/found a notification
+        if (nextId !== null) {
+          // Get ALL push tokens for this student
+          const pushTokens = await getAllPushTokensForStudent(studentId);
 
-        // Send push notification via FCM (if tokens available)
-        if (pushTokens.length > 0) {
-          const pushResult = await sendPushNotification(
-            pushTokens,
-            notificationTitle,
-            message,
-            {
-              notificationId: String(nextId),
-              type: 'payment',
-              date: dateStr,
+          // Send push notification via Expo (if tokens available)
+          if (pushTokens.length > 0) {
+            const pushResult = await sendPushNotification(
+              pushTokens,
+              notificationTitle,
+              message,
+              {
+                notificationId: String(nextId),
+                type: 'payment',
+                date: dateStr,
+              }
+            );
+
+            if (pushResult.success) {
+              console.log(`📤 Push notification sent to student ${studentId}: ${pushResult.successCount} device(s) - Payment received`);
+            } else {
+              console.log(`⚠️  Push notification failed for student ${studentId}: ${pushResult.reason || pushResult.error}`);
             }
-          );
-
-          if (pushResult.success) {
-            console.log(`📤 Push notification sent to student ${studentId}: ${pushResult.successCount} device(s) - Payment received`);
           } else {
-            console.log(`⚠️  Push notification failed for student ${studentId}: ${pushResult.reason || pushResult.error}`);
+            console.log(`⚠️  No push tokens found for student ${studentId}, notification saved but not pushed`);
           }
-        }
 
-        // Send push notification via Socket.IO (if client is connected)
-        io.to(`student_${studentId}`).emit('notification', {
-          id: nextId,
-          type: 'payment',
-          title: notificationTitle,
-          message: message,
-          date: dateStr,
-          read: false,
-        });
-
-        if (pushTokens.length === 0) {
-          console.log(`⚠️  No push tokens found for student ${studentId}, notification saved but not pushed`);
+          // Send push notification via Socket.IO (if client is connected)
+          io.to(`student_${studentId}`).emit('notification', {
+            id: nextId,
+            type: 'payment',
+            title: notificationTitle,
+            message: message,
+            date: dateStr,
+            read: false,
+          });
         }
       }
     }
@@ -2346,67 +2367,96 @@ async function checkForNewRecords() {
           const fullMessage = message; // Store just the message, title is separate
           const year = record.year || null; // Get year from attendance record
 
-          // Insert notification into notifications table
-          // The table's id column doesn't have AUTO_INCREMENT, so we need to provide it manually
-          try {
-            // Get the maximum ID and increment it
-            const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
-            const nextId = (maxIdResult[0]?.max_id || 0) + 1;
-            
-            await pool.execute(
-              'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-              [nextId, studentId, 'attendance', notificationTitle, fullMessage, dateStr, year, timeStr || null, 0]
-            );
-          } catch (insertError) {
-            // If duplicate key error, try with a higher ID
-            if (insertError.code === 'ER_DUP_ENTRY') {
+          // Check if notification already exists for this attendance to avoid duplicates
+          const [existingNotif] = await pool.execute(
+            'SELECT id FROM notifications WHERE student_id = ? AND type = ? AND title = ? AND message = ? AND date = ? LIMIT 1',
+            [studentId, 'attendance', notificationTitle, fullMessage, dateStr]
+          );
+
+          let nextId = null;
+
+          // Only insert if notification doesn't already exist
+          if (existingNotif.length === 0) {
+            // Insert notification into notifications table
+            // The table's id column doesn't have AUTO_INCREMENT, so we need to provide it manually
+            try {
+              // Get the maximum ID and increment it
               const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
-              const nextId = (maxIdResult[0]?.max_id || 0) + 10; // Add buffer to avoid conflicts
+              nextId = (maxIdResult[0]?.max_id || 0) + 1;
+              
               await pool.execute(
                 'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 [nextId, studentId, 'attendance', notificationTitle, fullMessage, dateStr, year, timeStr || null, 0]
               );
-            } else {
-              console.error('❌ Error inserting attendance notification:', insertError);
-              throw insertError;
-            }
-          }
-
-          // Get ALL push tokens for this student
-          const pushTokens = await getAllPushTokensForStudent(studentId);
-
-          // Send push notification via FCM (if tokens available)
-          if (pushTokens.length > 0) {
-            const pushResult = await sendPushNotification(
-              pushTokens,
-              notificationTitle,
-              message,
-              {
-                notificationId: String(nextId),
-                type: 'attendance',
-                date: dateStr,
+              console.log(`✅ Attendance notification inserted: ID=${nextId}, Student=${studentId}, Title="${notificationTitle}", Attendance ID=${record.id}, Status=${status}`);
+            } catch (insertError) {
+              // If duplicate key error, try with a higher ID
+              if (insertError.code === 'ER_DUP_ENTRY') {
+                try {
+                  const [maxIdResult] = await pool.execute('SELECT MAX(id) as max_id FROM notifications');
+                  nextId = (maxIdResult[0]?.max_id || 0) + 10; // Add buffer to avoid conflicts
+                  await pool.execute(
+                    'INSERT INTO notifications (id, student_id, type, title, message, date, year, time, `read`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    [nextId, studentId, 'attendance', notificationTitle, fullMessage, dateStr, year, timeStr || null, 0]
+                  );
+                  console.log(`✅ Attendance notification inserted (retry): ID=${nextId}, Student=${studentId}, Attendance ID=${record.id}`);
+                } catch (retryError) {
+                  console.error(`❌ Error inserting attendance notification (retry failed):`, retryError.message);
+                  console.error('   SQL Error:', retryError.sqlMessage || retryError.message);
+                  console.error('   Attendance ID:', record.id);
+                  continue; // Skip to next attendance record if insertion fails
+                }
+              } else {
+                console.error('❌ Error inserting attendance notification:', insertError.message);
+                console.error('   SQL Error:', insertError.sqlMessage || insertError.message);
+                console.error('   SQL State:', insertError.sqlState || 'N/A');
+                console.error('   Error Code:', insertError.code || 'N/A');
+                console.error('   Attendance ID:', record.id);
+                continue; // Skip to next attendance record if insertion fails
               }
-            );
-
-            if (pushResult.success) {
-              console.log(`📤 Push notification sent to student ${studentId}: ${pushResult.successCount} device(s) - ${studentName} - ${status}`);
-            } else {
-              console.log(`⚠️  Push notification failed for student ${studentId}: ${pushResult.reason || pushResult.error}`);
             }
+          } else {
+            // Notification already exists, use existing ID
+            nextId = existingNotif[0].id;
+            console.log(`ℹ️  Attendance notification already exists: ID=${nextId}, Student=${studentId}, Attendance ID=${record.id}`);
           }
 
-          // Send push notification via Socket.IO (if client is connected)
-          io.to(`student_${studentId}`).emit('notification', {
-            id: nextId,
-            type: 'attendance',
-            title: notificationTitle,
-            message: message,
-            date: dateStr,
-            read: false,
-          });
+          // Only send push notifications if we successfully created/found a notification
+          if (nextId !== null) {
+            // Get ALL push tokens for this student
+            const pushTokens = await getAllPushTokensForStudent(studentId);
 
-          if (pushTokens.length === 0) {
-            console.log(`⚠️  No push tokens found for student ${studentId}, notification saved but not pushed`);
+            // Send push notification via Expo (if tokens available)
+            if (pushTokens.length > 0) {
+              const pushResult = await sendPushNotification(
+                pushTokens,
+                notificationTitle,
+                message,
+                {
+                  notificationId: String(nextId),
+                  type: 'attendance',
+                  date: dateStr,
+                }
+              );
+
+              if (pushResult.success) {
+                console.log(`📤 Push notification sent to student ${studentId}: ${pushResult.successCount} device(s) - ${studentName} - ${status}`);
+              } else {
+                console.log(`⚠️  Push notification failed for student ${studentId}: ${pushResult.reason || pushResult.error}`);
+              }
+            } else {
+              console.log(`⚠️  No push tokens found for student ${studentId}, notification saved but not pushed`);
+            }
+
+            // Send push notification via Socket.IO (if client is connected)
+            io.to(`student_${studentId}`).emit('notification', {
+              id: nextId,
+              type: 'attendance',
+              title: notificationTitle,
+              message: message,
+              date: dateStr,
+              read: false,
+            });
           }
         }
       }
